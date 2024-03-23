@@ -1,58 +1,133 @@
 import numpy as np
 import pandas as pd
 import os
+from lightgbm.sklearn import LGBMClassifier
+from sklearn.preprocessing import LabelEncoder
 
 
 def column_check(data1, data2):
     return set(data1.columns) == set(data1.columns).intersection(data2.columns)
 
 
-def concat_and_merge(train_data, path_list, train_files_path, nrows):
+def merge_duplicate_group_cols(data):
+    if 'num_group1_x' in data.columns:
+        data.loc[:, 'num_group1_x'] = data.loc[:, 'num_group1_x'].fillna(data.loc[:, 'num_group1_y'])
+        data.drop('num_group1_y', axis=1, inplace=True)
+        data.rename(columns={'num_group1_x': 'num_group1'}, inplace=True)
+
+    if 'num_group2_x' in data.columns:
+        data.loc[:, 'num_group2_x'] = data.loc[:, 'num_group2_x'].fillna(data.loc[:, 'num_group2_y'])
+        data.drop('num_group2_y', axis=1, inplace=True)
+        data.rename(columns={'num_group2_x': 'num_group2'}, inplace=True)
+    return data
+
+
+def concat_and_merge(base_data, path_list, base_path, rows):
     data = pd.DataFrame()
     for file in path_list:
-        data = pd.concat([data, pd.read_csv(train_files_path + file, nrows=nrows, low_memory=False)], axis=0)
+        data = pd.concat([data, pd.read_csv(base_path + file, nrows=rows, low_memory=False)], axis=0)
 
     data.drop_duplicates(subset=['case_id'], keep='first', inplace=True)
-    return train_data.merge(data, on='case_id', how='left')
+    base_data = base_data.merge(data, on='case_id', how='left')
+
+    return merge_duplicate_group_cols(base_data)
 
 
-nrows = None
-train_files_path = 'csv_files/train/'
+def get_file_names(file_names, keyword):
+    return [x for x in file_names if keyword in x]
 
-train_files = os.listdir(train_files_path)
-train = pd.read_csv(train_files_path + 'train_base.csv', nrows=nrows)
 
-applprev_paths = ['train_applprev_1_0.csv', 'train_applprev_1_1.csv']
-train = concat_and_merge(train, applprev_paths, train_files_path, nrows)
+nrows = 5000
+files_path = 'csv_files/train/'
 
-credit_a1_paths = ['train_credit_bureau_a_1_0.csv', 'train_credit_bureau_a_1_1.csv', 'train_credit_bureau_a_1_2.csv',
-                   'train_credit_bureau_a_1_3.csv']
-train = concat_and_merge(train, credit_a1_paths, train_files_path, nrows)
+files = os.listdir(files_path)
 
-credit_a2_paths = ['train_credit_bureau_a_2_0.csv', 'train_credit_bureau_a_2_1.csv', 'train_credit_bureau_a_2_10.csv',
-                   'train_credit_bureau_a_2_2.csv', 'train_credit_bureau_a_2_3.csv', 'train_credit_bureau_a_2_4.csv',
-                   'train_credit_bureau_a_2_5.csv', 'train_credit_bureau_a_2_6.csv', 'train_credit_bureau_a_2_7.csv',
-                   'train_credit_bureau_a_2_8.csv', 'train_credit_bureau_a_2_9.csv', 'train_credit_bureau_a_2_10.csv']
-train = concat_and_merge(train, credit_a2_paths, train_files_path, nrows)
+base_file = ['train_base.csv']
+applprev_files = get_file_names(files, 'applprev')
+credit_a1_files = get_file_names(files, 'credit_bureau_a_1')
+credit_a2_files = get_file_names(files, 'credit_bureau_a_2')
+credit_b_files = get_file_names(files, 'credit_bureau_b')
+static0_files = get_file_names(files, 'static_0')
+rest_of_files = set(files) - set(applprev_files + credit_a1_files + credit_a2_files + credit_b_files +
+                                 static0_files + base_file)
 
-credit_b_paths = ['train_credit_bureau_b_1.csv', 'train_credit_bureau_b_2.csv']
-train = concat_and_merge(train, credit_b_paths, train_files_path, nrows)
 
-static_paths = ['train_static_0_0.csv', 'train_static_0_1.csv']
-train = concat_and_merge(train, static_paths, train_files_path, nrows)
-
-rest_of_files = ['train_debitcard_1.csv', 'train_deposit_1.csv',
-                 'train_other_1.csv', 'train_person_1.csv', 'train_person_2.csv',
-                 'train_static_cb_0.csv', 'train_tax_registry_a_1.csv', 'train_tax_registry_b_1.csv',
-                 'train_tax_registry_c_1.csv']
+base = pd.read_csv(files_path + base_file[0], nrows=nrows)
+base = concat_and_merge(base, applprev_files, files_path, nrows)
+base = concat_and_merge(base, credit_a1_files, files_path, nrows)
+base = concat_and_merge(base, credit_a2_files, files_path, nrows)
+base = concat_and_merge(base, credit_b_files, files_path, nrows)
+base = concat_and_merge(base, static0_files, files_path, nrows)
 
 for file in rest_of_files:
-    data = pd.read_csv(train_files_path + file, nrows=nrows)
+    data = pd.read_csv(files_path + file, nrows=nrows)
     data.drop_duplicates(subset=['case_id'], keep='first', inplace=True)
-    train = train.merge(data, on='case_id', how='left')
+    base = base.merge(data, on='case_id', how='left')
+    base = merge_duplicate_group_cols(base)
 
 del data
 
-print(train['case_id'].nunique())
-null_counts = train.apply(lambda x: x.isnull().sum() / len(x))
-missing_cols = null_counts[null_counts > 0.4].index.tolist()
+print(base['case_id'].nunique())
+null_counts = base.apply(lambda x: x.isnull().sum() / len(x))
+missing_cols = null_counts[null_counts > 0.3].index.tolist()
+
+base.drop(columns=missing_cols, inplace=True)
+
+columns_to_fit = base.columns.drop(['case_id', 'target', 'num_group1', 'date_decision']).tolist()
+
+object_cols = base[columns_to_fit].select_dtypes(include=['object']).columns
+object_cols = object_cols.tolist()
+
+encoders = dict()
+for col in object_cols:
+    le = LabelEncoder()
+    base[col] = le.fit_transform(base[col])
+    encoders[col] = le
+
+lgb = LGBMClassifier(n_estimators=100)
+lgb.fit(base[columns_to_fit], base['target'], categorical_feature=object_cols)
+
+del base
+
+#==============================================
+# test
+#==============================================
+
+nrows = None
+files_path = 'csv_files/test/'
+
+files = os.listdir(files_path)
+
+base_file = ['test_base.csv']
+applprev_files = get_file_names(files, 'applprev')
+credit_a1_files = get_file_names(files, 'credit_bureau_a_1')
+credit_a2_files = get_file_names(files, 'credit_bureau_a_2')
+credit_b_files = get_file_names(files, 'credit_bureau_b')
+static0_files = get_file_names(files, 'static_0')
+rest_of_files = set(files) - set(applprev_files + credit_a1_files + credit_a2_files + credit_b_files +
+                                 static0_files + base_file)
+
+base = pd.read_csv(files_path + base_file[0], nrows=nrows)
+base = concat_and_merge(base, applprev_files, files_path, nrows)
+base = concat_and_merge(base, credit_a1_files, files_path, nrows)
+base = concat_and_merge(base, credit_a2_files, files_path, nrows)
+base = concat_and_merge(base, credit_b_files, files_path, nrows)
+base = concat_and_merge(base, static0_files, files_path, nrows)
+
+for file in rest_of_files:
+    data = pd.read_csv(files_path + file, nrows=nrows)
+    data.drop_duplicates(subset=['case_id'], keep='first', inplace=True)
+    base = base.merge(data, on='case_id', how='left')
+    base = merge_duplicate_group_cols(base)
+
+del data
+
+for col in object_cols:
+    base[col] = base[col].map(lambda s: 'unknown' if s not in encoders[col].classes_ else s)
+    encoders[col].classes_ = np.append(encoders[col].classes_, 'unknown')  # Add 'unknown' to classes
+    base[col] = encoders[col].transform(base[col])
+
+submission = base[['case_id']]
+submission.loc[:, 'score'] = lgb.predict_proba(base[columns_to_fit])[:, 1]
+submission = submission.set_index('case_id')
+submission.to_csv('./submission.csv')
