@@ -37,7 +37,14 @@ def get_file_names(file_names, keyword):
     return [x for x in file_names if keyword in x]
 
 
-nrows = 5000
+def is_include_features(path_list, base_path, feature_names: list) -> set:
+    data = pd.DataFrame()
+    for file in path_list:
+        data = pd.concat([data, pd.read_csv(base_path + file, nrows=1, low_memory=False)], axis=0)
+    return set(feature_names).intersection(set(data.columns))
+
+
+nrows = None
 files_path = 'csv_files/train/'
 
 files = os.listdir(files_path)
@@ -60,7 +67,7 @@ base = concat_and_merge(base, credit_b_files, files_path, nrows)
 base = concat_and_merge(base, static0_files, files_path, nrows)
 
 for file in rest_of_files:
-    data = pd.read_csv(files_path + file, nrows=nrows)
+    data = pd.read_csv(files_path + file, nrows=nrows, low_memory=False)
     data.drop_duplicates(subset=['case_id'], keep='first', inplace=True)
     base = base.merge(data, on='case_id', how='left')
     base = merge_duplicate_group_cols(base)
@@ -87,7 +94,18 @@ for col in object_cols:
 lgb = LGBMClassifier(n_estimators=100)
 lgb.fit(base[columns_to_fit], base['target'], categorical_feature=object_cols)
 
+feature_importances = pd.DataFrame({'feature': lgb.feature_name_,'imp_point': lgb.feature_importances_})
+feature_importances.sort_values(by='imp_point', ascending=False, inplace=True)
+best20_fetures = list(feature_importances['feature'].head(20))
+
 del base
+
+appl_features = is_include_features(applprev_files, files_path, best20_fetures)
+credit_a1_features = is_include_features(credit_a1_files, files_path, best20_fetures)
+credit_a2_features = is_include_features(credit_a2_files, files_path, best20_fetures)
+credit_b_features = is_include_features(credit_b_files, files_path, best20_fetures)
+static0_features = is_include_features(static0_files, files_path, best20_fetures)
+
 
 #==============================================
 # test
