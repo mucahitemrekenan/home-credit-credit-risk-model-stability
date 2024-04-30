@@ -1,3 +1,5 @@
+from typing import List, Any
+
 import numpy as np
 import pandas as pd
 import os
@@ -22,10 +24,15 @@ def merge_duplicate_group_cols(data):
     return data
 
 
-def concat_and_merge(base_data, path_list, base_path, rows):
+def concat_and_merge(base_data, path_list, base_path, rows, cols_to_merge=None):
     data = pd.DataFrame()
     for file in path_list:
-        data = pd.concat([data, pd.read_csv(base_path + file, nrows=rows, low_memory=False)], axis=0)
+        if cols_to_merge:
+            # I specify whether read all columns or a given list of columns.
+            data = pd.concat([data, pd.read_csv(base_path + file, usecols=['case_id'] + cols_to_merge, nrows=rows,
+                                                low_memory=False)], axis=0)
+        else:
+            data = pd.concat([data, pd.read_csv(base_path + file, nrows=rows, low_memory=False)], axis=0)
 
     data.drop_duplicates(subset=['case_id'], keep='first', inplace=True)
     base_data = base_data.merge(data, on='case_id', how='left')
@@ -37,11 +44,11 @@ def get_file_names(file_names, keyword):
     return [x for x in file_names if keyword in x]
 
 
-def is_include_features(path_list, base_path, feature_names: list) -> set:
+def is_include_features(path_list, base_path, feature_names: list) -> list:
     data = pd.DataFrame()
     for file in path_list:
         data = pd.concat([data, pd.read_csv(base_path + file, nrows=1, low_memory=False)], axis=0)
-    return set(feature_names).intersection(set(data.columns))
+    return list(set(feature_names).intersection(set(data.columns)))
 
 
 nrows = None
@@ -106,6 +113,7 @@ credit_a2_features = is_include_features(credit_a2_files, files_path, best20_fet
 credit_b_features = is_include_features(credit_b_files, files_path, best20_fetures)
 static0_features = is_include_features(static0_files, files_path, best20_fetures)
 
+rest_of_features = list(set(best20_fetures).difference(set(appl_features+credit_a1_features+credit_a2_features+credit_b_features+static0_features)))
 
 #==============================================
 # test
