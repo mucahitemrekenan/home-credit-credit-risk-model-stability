@@ -8,6 +8,7 @@ import time
 from tqdm import tqdm
 from itertools import combinations
 
+
 def column_check(data1, data2):
     return set(data1.columns) == set(data1.columns).intersection(data2.columns)
 
@@ -126,7 +127,6 @@ static0_files = get_file_names(files, 'static_0')
 rest_of_files = set(files) - set(applprev_files + credit_a1_files + credit_a2_files + credit_b_files +
                                  static0_files + base_file)
 
-
 base = pd.read_csv(files_path + base_file[0], nrows=nrows)
 base = concat_and_merge(base, applprev_files, files_path, nrows)
 base = concat_and_merge(base, credit_a1_files, files_path, nrows)
@@ -239,19 +239,19 @@ for pair in date_col_pairs:
 
 pair_raitos_data = pd.DataFrame(pair_similarity_ratios.items())
 
-check_null_ratio('creationdate_885D', date_data)
-check_null_ratio('lastapplicationdate_877D', date_data)
+check_null_ratio(['creationdate_885D'], date_data)
+check_null_ratio(['lastapplicationdate_877D'], date_data)
 
 cols_to_drop = ['lastapplicationdate_877D']
 
-check_null_ratio('dateofbirth_337D', date_data)
-check_null_ratio('birth_259D', date_data)
+check_null_ratio(['dateofbirth_337D'], date_data)
+check_null_ratio(['birth_259D'], date_data)
 
 cols_to_drop.extend(['dateofbirth_337D'])
 
 
-check_null_ratio('lastapplicationdate_877D', date_data)
-check_null_ratio('lastapprdate_640D', date_data)
+check_null_ratio(['lastapplicationdate_877D'], date_data)
+check_null_ratio(['lastapprdate_640D'], date_data)
 
 # the ratios were different, nunique doesn't count nan values as unique. i will use '=' operator for similarity check
 print('similar row ratio:', len(base[base[['lastapplicationdate_877D', 'lastapprdate_640D']].nunique(axis=1) == 1]) / len(base))
@@ -268,19 +268,21 @@ print('similar row ratio:', len(sub_data2[sub_data2['lastapplicationdate_877D'] 
 
 cols_to_drop.extend(['lastapprdate_640D'])
 
-check_null_ratio('firstnonzeroinstldate_307D', date_data)
-check_null_ratio('firstdatedue_489D', date_data)
+check_null_ratio(['firstnonzeroinstldate_307D'], date_data)
+check_null_ratio(['firstdatedue_489D'], date_data)
 
 print('similar row ratio:', len(base[base['firstnonzeroinstldate_307D'] == base['firstdatedue_489D']]) / len(base))
 
-object_col_pairs = list(combinations(non_date_categorical_cols, 2))
-object_similarity_ratios = dict()
-for pair in tqdm(object_col_pairs):
-    col1, col2 = pair
-    object_similarity_ratios[pair] = len(non_date_object_data[non_date_object_data[col1] == non_date_object_data[col2]]) / len(non_date_object_data)
+# object_col_pairs = list(combinations(non_date_categorical_cols, 2))
+# object_similarity_ratios = dict()
+# for pair in tqdm(object_col_pairs):
+#     col1, col2 = pair
+#     object_similarity_ratios[pair] = len(non_date_object_data[non_date_object_data[col1] == non_date_object_data[col2]]) / len(non_date_object_data)
+#
+# object_raitos_data = pd.DataFrame(object_similarity_ratios.items())
+# object_raitos_data.to_excel('object_similarity_ratios.xlsx', index=False)
 
-object_raitos_data = pd.DataFrame(object_similarity_ratios.items())
-object_raitos_data.to_excel('object_similarity_ratios.xlsx', index=False)
+object_raitos_data = pd.read_excel('object_similarity_ratios.xlsx')
 
 col1, col2 = ('status_219L', 'lastst_736L')
 analyze_col_pairs([col1, col2], base, feature_defs)
