@@ -1,348 +1,279 @@
+# %%
+import os
+import gc
+from glob import glob
+from pathlib import Path
+from datetime import datetime
+
 import numpy as np
 import pandas as pd
-import os
-from lightgbm import LGBMClassifier
-from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import confusion_matrix
-from sklearn.model_selection import ParameterGrid
+import polars as pl
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from sklearn.model_selection import StratifiedGroupKFold
+from sklearn.base import BaseEstimator, RegressorMixin
+
+import joblib
 from tqdm import tqdm
-from xgboost import XGBClassifier
+from lightgbm import LGBMClassifier
+from xgboost import XGBClassifier, DMatrix
+
+import warnings
+
+warnings.simplefilter(action='ignore', category=FutureWarning)
+
+print('import done')
 
 
-def column_check(data1, data2):
-	return set(data1.columns) == set(data1.columns).intersection(data2.columns)
+class VotingModel(BaseEstimator, RegressorMixin):
+	def __init__(self, estimators):
+		super().__init__()
+		self.estimators = estimators
+
+	def fit(self, X, y=None):
+		return self
+
+	def predict(self, X):
+		y_preds = [estimator.predict(X) for estimator in self.estimators]
+		return np.mean(y_preds, axis=0)
+
+	def predict_proba(self, X):
+		y_preds = [estimator.predict_proba(X) for estimator in self.estimators]
+		return np.mean(y_preds, axis=0)
 
 
-def merge_duplicate_group_cols(data):
-	if 'num_group1_x' in data.columns:
-		data.loc[:, 'num_group1_x'] = data.loc[:, 'num_group1_x'].fillna(data.loc[:, 'num_group1_y'])
-		data.drop('num_group1_y', axis=1, inplace=True)
-		data.rename(columns={'num_group1_x': 'num_group1'}, inplace=True)
+class Pipeline:
+	@staticmethod
+	def set_table_dtypes(df):
+		for col in df.columns:
+			if col in ["case_id", "WEEK_NUM", "num_group1", "num_group2"]:
+				df = df.with_columns(pl.col(col).cast(pl.Int64))
+			elif col in ["date_decision"]:
+				df = df.with_columns(pl.col(col).cast(pl.Date))
+			elif col[-1] in ("P", "A"):
+				df = df.with_columns(pl.col(col).cast(pl.Float64))
+			elif col[-1] in ("M",):
+				df = df.with_columns(pl.col(col).cast(pl.String))
+			elif col[-1] in ("D",):
+				df = df.with_columns(pl.col(col).cast(pl.Date))
 
-	if 'num_group2_x' in data.columns:
-		data.loc[:, 'num_group2_x'] = data.loc[:, 'num_group2_x'].fillna(data.loc[:, 'num_group2_y'])
-		data.drop('num_group2_y', axis=1, inplace=True)
-		data.rename(columns={'num_group2_x': 'num_group2'}, inplace=True)
-	return data
+		return df
+
+	@staticmethod
+	def handle_dates(df):
+		for col in df.columns:
+			if col[-1] in ("D",):
+				df = df.with_columns(pl.col(col) - pl.col("date_decision"))
+				df = df.with_columns(pl.col(col).dt.total_days())
+
+		df = df.drop("date_decision", "MONTH")
+
+		return df
+
+	@staticmethod
+	def filter_cols(df):
+		for col in df.columns:
+			if col not in ["target", "case_id", "WEEK_NUM"]:
+				isnull = df[col].is_null().mean()
+
+				if isnull > 0.95:
+					df = df.drop(col)
+
+		for col in df.columns:
+			if (col not in ["target", "case_id", "WEEK_NUM"]) & (df[col].dtype == pl.String):
+				freq = df[col].n_unique()
+
+				if (freq == 1) | (freq > 200):
+					df = df.drop(col)
+
+		return df
 
 
-def concat_and_merge(base_data, path_list, base_path, rows, cols_to_merge=None):
-	data = pd.DataFrame()
-	for file in path_list:
-		if cols_to_merge:
-			# I specify whether read all columns or a given list of columns.
-			data = pd.concat([data, pd.read_csv(base_path + file, usecols=['case_id'] + cols_to_merge, nrows=rows,
-												low_memory=False)], axis=0)
+class Aggregator:
+	@staticmethod
+	def num_expr(df):
+		cols = [col for col in df.columns if col[-1] in ("P", "A")]
+
+		expr_max = [pl.max(col).alias(f"max_{col}") for col in cols]
+
+		return expr_max
+
+	@staticmethod
+	def date_expr(df):
+		cols = [col for col in df.columns if col[-1] in ("D",)]
+
+		expr_max = [pl.max(col).alias(f"max_{col}") for col in cols]
+
+		return expr_max
+
+	@staticmethod
+	def str_expr(df):
+		cols = [col for col in df.columns if col[-1] in ("M",)]
+
+		expr_max = [pl.max(col).alias(f"max_{col}") for col in cols]
+
+		return expr_max
+
+	@staticmethod
+	def other_expr(df):
+		cols = [col for col in df.columns if col[-1] in ("T", "L")]
+
+		expr_max = [pl.max(col).alias(f"max_{col}") for col in cols]
+
+		return expr_max
+
+	@staticmethod
+	def count_expr(df):
+		cols = [col for col in df.columns if "num_group" in col]
+
+		expr_max = [pl.max(col).alias(f"max_{col}") for col in cols]
+
+		return expr_max
+
+	@staticmethod
+	def get_exprs(df):
+		exprs = Aggregator.num_expr(df) + \
+				Aggregator.date_expr(df) + \
+				Aggregator.str_expr(df) + \
+				Aggregator.other_expr(df) + \
+				Aggregator.count_expr(df)
+
+		return exprs
+
+
+def read_file(path, depth=None):
+	df = pl.read_parquet(path)
+	df = df.pipe(Pipeline.set_table_dtypes)
+
+	if depth in [1, 2]:
+		df = df.group_by("case_id").agg(Aggregator.get_exprs(df))
+
+	return df
+
+
+def read_files(regex_path, depth=None):
+	chunks = []
+	for path in glob(str(regex_path)):
+		chunks.append(pl.read_parquet(path).pipe(Pipeline.set_table_dtypes))
+
+	df = pl.concat(chunks, how="vertical_relaxed")
+	if depth in [1, 2]:
+		df = df.group_by("case_id").agg(Aggregator.get_exprs(df))
+
+	return df
+
+
+def feature_eng(df_base, depth_0, depth_1, depth_2):
+	df_base = (
+		df_base
+		.with_columns(
+			month_decision=pl.col("date_decision").dt.month(),
+			weekday_decision=pl.col("date_decision").dt.weekday(),
+		)
+	)
+
+	for i, df in enumerate(depth_0 + depth_1 + depth_2):
+		df_base = df_base.join(df, how="left", on="case_id", suffix=f"_{i}")
+
+	df_base = df_base.pipe(Pipeline.handle_dates)
+
+	return df_base
+
+
+def to_pandas(df_data, cat_cols=None):
+	df_data = df_data.to_pandas()
+
+	if cat_cols is None:
+		cat_cols = list(df_data.select_dtypes("object").columns)
+
+	df_data[cat_cols] = df_data[cat_cols].astype("category")
+
+	return df_data, cat_cols
+
+
+def reduce_mem_usage(df):
+	""" iterate through all the columns of a dataframe and modify the data type
+		to reduce memory usage.
+	"""
+	start_mem = df.memory_usage().sum() / 1024 ** 2
+	print('Memory usage of dataframe is {:.2f} MB'.format(start_mem))
+
+	for col in df.columns:
+		col_type = df[col].dtype
+		if str(col_type) == "category":
+			continue
+
+		if col_type != object:
+			c_min = df[col].min()
+			c_max = df[col].max()
+			if str(col_type)[:3] == 'int':
+				if c_min > np.iinfo(np.int8).min and c_max < np.iinfo(np.int8).max:
+					df[col] = df[col].astype(np.int8)
+				elif c_min > np.iinfo(np.int16).min and c_max < np.iinfo(np.int16).max:
+					df[col] = df[col].astype(np.int16)
+				elif c_min > np.iinfo(np.int32).min and c_max < np.iinfo(np.int32).max:
+					df[col] = df[col].astype(np.int32)
+				elif c_min > np.iinfo(np.int64).min and c_max < np.iinfo(np.int64).max:
+					df[col] = df[col].astype(np.int64)
+			else:
+				if c_min > np.finfo(np.float16).min and c_max < np.finfo(np.float16).max:
+					df[col] = df[col].astype(np.float16)
+				elif c_min > np.finfo(np.float32).min and c_max < np.finfo(np.float32).max:
+					df[col] = df[col].astype(np.float32)
+				else:
+					df[col] = df[col].astype(np.float64)
 		else:
-			data = pd.concat([data, pd.read_csv(base_path + file, nrows=rows, low_memory=False)], axis=0)
+			continue
+	end_mem = df.memory_usage().sum() / 1024 ** 2
+	print('Memory usage after optimization is: {:.2f} MB'.format(end_mem))
+	print('Decreased by {:.1f}%'.format(100 * (start_mem - end_mem) / start_mem))
 
-	data.drop_duplicates(subset=['case_id'], keep='first', inplace=True)
-	base_data = base_data.merge(data, on='case_id', how='left')
-
-	return merge_duplicate_group_cols(base_data)
-
-
-def get_file_names(file_names, keyword):
-	return [x for x in file_names if keyword in x]
+	return df
 
 
-nrows = None
-files_path = 'csv_files/train/'
+print('functions done')
 
-files = os.listdir(files_path)
 
-base_file = ['train_base.csv']
-applprev_files = get_file_names(files, 'applprev_1')
-credit_a1_files = get_file_names(files, 'credit_bureau_a_1')
-credit_a2_files = get_file_names(files, 'credit_bureau_a_2')
-credit_b_files = get_file_names(files, 'credit_bureau_b')
-static0_files = get_file_names(files, 'static_0')
-rest_of_files = set(files) - set(applprev_files + credit_a1_files + credit_a2_files + credit_b_files +
-								 static0_files + base_file)
+class DataPreparation:
+	def __init__(self):
+		self.df_train = None
 
-appl_features = [
-	'inittransactioncode_279L',
-	'actualdpd_943P',
-	'pmtnum_8L',
-	'credamount_590A',
-	'district_544M',
-	'annuity_853A',
-	'cancelreason_3545846M',
-	'downpmt_134A',
-	'creationdate_885D',
-	'status_219L',
-	'mainoccupationinc_437A',
-	'rejectreason_755M',
-	'rejectreasonclient_4145042M',
-	'education_1138M',
-	'postype_4733339M',
-	'credtype_587L',
-	'firstnonzeroinstldate_307D',
-	'tenor_203L',
-	'profession_152M',
-	'credacc_credlmt_575A',
-	'isbidproduct_390L']
+	def prepare_data(self):
+		ROOT = Path("D:/projects\home-credit-credit-risk-model-stability")
+		TRAIN_DIR = ROOT / "parquet_files" / "train"
 
-credit_a1_features = [
-	'dpdmaxdateyear_596T',
-	'numberofcontrsvalue_358L',
-	'numberofoverdueinstlmax_1039L',
-	'classificationofcontr_13M',
-	'dateofcredend_289D',
-	'dateofcredstart_739D',
-	'totaloutstanddebtvalue_668A',
-	'totaldebtoverduevalue_178A',
-	'numberofoverdueinstls_725L',
-	'subjectrole_182M',
-	'monthlyinstlamount_332A',
-	'financialinstitution_382M',
-	'description_351M',
-	'financialinstitution_591M',
-	'overdueamountmaxdateyear_2T',
-	'overdueamount_659A',
-	'contractst_545M',
-	'contractst_964M',
-	'purposeofcred_426M',
-	'dpdmaxdatemonth_89T',
-	'totaldebtoverduevalue_718A',
-	'debtoverdue_47A',
-	'totaloutstanddebtvalue_39A',
-	'purposeofcred_874M',
-	'debtoutstand_525A',
-	'overdueamountmax2_14A',
-	'dpdmax_139P',
-	'numberofcontrsvalue_258L',
-	'overdueamountmax_155A',
-	'overdueamountmaxdatemonth_365T',
-	'subjectrole_93M',
-	'classificationofcontr_400M',
-	'lastupdate_1112D']
-
-static0_features = [
-	'annuitynextmonth_57A',
-	'interestrate_311L',
-	'inittransactioncode_186L',
-	'numcontrs3months_479L',
-	'cntpmts24_3658933L',
-	'lastrejectcommodtypec_5251769M',
-	'lastapprcommoditycat_1041M',
-	'lastapprdate_640D',
-	'pctinstlsallpaidlate6d_3546844L',
-	'applications30d_658L',
-	'numinstpaidearly3d_3546850L',
-	'posfpd30lastmonth_3976960P',
-	'mobilephncnt_593L',
-	'clientscnt_100L',
-	'lastst_736L',
-	'mastercontrelectronic_519L',
-	'maxdebt4_972A',
-	'currdebtcredtyperange_828A',
-	'numinstregularpaid_973L',
-	'applicationscnt_464L',
-	'numactivecredschannel_414L',
-	'daysoverduetolerancedd_3976961L',
-	'maxdpdlast6m_474P',
-	'firstdatedue_489D',
-	'lastrejectcommoditycat_161M',
-	'cntincpaycont9m_3716944L',
-	'pctinstlsallpaidearl3d_427L',
-	'disbursementtype_67L',
-	'lastapprcommoditytypec_5251766M',
-	'twobodfilling_608L',
-	'applicationscnt_1086L',
-	'numincomingpmts_3546848L',
-	'pctinstlsallpaidlate4d_3546849L',
-	'maxdpdfrom6mto36m_3546853P',
-	'clientscnt12m_3712952L',
-	'clientscnt_1071L',
-	'mastercontrexist_109L',
-	'deferredmnthsnum_166L',
-	'pmtnum_254L',
-	'eir_270L',
-	'applicationcnt_361L',
-	'clientscnt6m_3712949L',
-	'maxdpdtolerance_374P',
-	'actualdpdtolerance_344P',
-	'clientscnt_493L',
-	'numinstpaidearly5d_1087L',
-	'downpmt_116A',
-	'totaldebt_9A',
-	'currdebt_22A',
-	'clientscnt_157L',
-	'pctinstlsallpaidlat10d_839L',
-	'lastrejectreason_759M',
-	'maininc_215A',
-	'clientscnt_533L',
-	'price_1097A',
-	'annuity_780A',
-	'lastactivateddate_801D',
-	'homephncnt_628L',
-	'numinstpaidlate1d_3546852L',
-	'disbursedcredamount_1113A',
-	'numinstunpaidmax_3546851L',
-	'posfpd10lastmonth_333P',
-	'numinstlswithdpd10_728L',
-	'sumoutstandtotal_3546847A',
-	'numnotactivated_1143L',
-	'numactiverelcontr_750L',
-	'numinstls_657L',
-	'numinstlsallpaid_934L',
-	'numactivecreds_622L',
-	'clientscnt_304L',
-	'applicationscnt_629L',
-	'numinstpaidearly_338L',
-	'paytype_783L',
-	'previouscontdistrict_112M',
-	'clientscnt_887L',
-	'sellerplacecnt_915L',
-	'lastapplicationdate_877D',
-	'numinstlswithoutdpd_562L',
-	'clientscnt_1022L',
-	'avgdpdtolclosure24_3658938P',
-	'credtype_322L',
-	'lastcancelreason_561M',
-	'opencred_647L',
-	'clientscnt_257L',
-	'clientscnt_946L',
-	'lastrejectreasonclient_4145040M',
-	'totalsettled_863A',
-	'paytype1st_925L',
-	'sellerplacescnt_216L',
-	'clientscnt_360L',
-	'monthsannuity_845L',
-	'maxannuity_159A',
-	'maxdpdlast12m_727P',
-	'posfstqpd30lastmonth_3976962P',
-	'isbidproduct_1095L',
-	'clientscnt_1130L',
-	'applicationscnt_867L',
-	'numinsttopaygr_769L',
-	'commnoinclast6m_3546845L',
-	'maxdpdlast24m_143P',
-	'pctinstlsallpaidlate1d_3546856L',
-	'lastapprcredamount_781A',
-	'numpmtchanneldd_318L',
-	'numinstlallpaidearly3d_817L',
-	'credamount_770A',
-	'maxdpdlast9m_1059P',
-	'clientscnt3m_3712950L',
-	'maxdpdlast3m_392P',
-	'numrejects9m_859L']
-
-rest_of_features = [
-	'conts_role_79M',
-	'days360_512L',
-	'contaddr_district_15M',
-	'birth_259D',
-	'secondquarter_766L',
-	'numberofqueries_373L',
-	'registaddr_zipcode_184M',
-	'role_1084L',
-	'days30_165L',
-	'personindex_1023L',
-	'incometype_1044T',
-	'firstquarter_103L',
-	'dateofbirth_337D',
-	'empls_employer_name_740M',
-	'addres_district_368M',
-	'education_1103M',
-	'education_88M',
-	'empls_economicalst_849M',
-	'fourthquarter_440L',
-	'mainoccupationinc_384A',
-	'contaddr_matchlist_1032L',
-	'contaddr_zipcode_807M',
-	'days90_310L',
-	'registaddr_district_1083M',
-	'empladdr_zipcode_114M',
-	'type_25L',
-	'persontype_1072L',
-	'language1_981M',
-	'empladdr_district_926M',
-	'description_5085714M',
-	'contaddr_smempladdr_334L',
-	'maritalst_893M',
-	'days120_123L',
-	'education_927M',
-	'safeguarantyflag_411L',
-	'addres_zip_823M',
-	'case_id',
-	'sex_738L',
-	'persontype_792L',
-	'thirdquarter_1082L',
-	'days180_256L',
-	'maritalst_385M']
-
-base = pd.read_csv(files_path + base_file[0], nrows=nrows)
-base = concat_and_merge(base, applprev_files, files_path, nrows, appl_features)
-base = concat_and_merge(base, credit_a1_files, files_path, nrows, credit_a1_features)
-base = concat_and_merge(base, static0_files, files_path, nrows, static0_features)
-
-for file in rest_of_files:
-	data = pd.read_csv(files_path + file, nrows=nrows, low_memory=False)
-	data.drop_duplicates(subset=['case_id'], keep='first', inplace=True)
-	base = base.merge(data, on='case_id', how='left')
-	base = merge_duplicate_group_cols(base)
-
-del data
-
-all_features = ['case_id', 'target', 'num_group1', 'date_decision'] + appl_features+credit_a1_features+static0_features+rest_of_features
-
-base = base.drop(columns=base.columns.difference(all_features))
-
-columns_to_fit = base.columns.drop(['case_id', 'target', 'num_group1', 'date_decision']).tolist()
-
-object_cols = base[columns_to_fit].select_dtypes(include=['object']).columns
-object_cols = object_cols.tolist()
-
-encoders = dict()
-for col in object_cols:
-	le = LabelEncoder()
-	base[col] = le.fit_transform(base[col])
-	encoders[col] = le
-
-for model_name in ['xgb', 'lightgbm']:
-	results = list()
-	if model_name == 'xgb':
-		param_grid = {
-			'n_estimators': [2000],
-			'learning_rate': [0.05],
-			'scale_pos_weight': [1, 30],
-			'max_depth': [0, 5, 10],
-			'device': ['cuda']
+		data_store = {
+			"df_base": read_file(TRAIN_DIR / "train_base.parquet"),
+			"depth_0": [
+				read_file(TRAIN_DIR / "train_static_cb_0.parquet"),
+				read_files(TRAIN_DIR / "train_static_0_*.parquet"),
+			],
+			"depth_1": [
+				read_files(TRAIN_DIR / "train_applprev_1_*.parquet", 1),
+				read_file(TRAIN_DIR / "train_tax_registry_a_1.parquet", 1),
+				read_file(TRAIN_DIR / "train_tax_registry_b_1.parquet", 1),
+				read_file(TRAIN_DIR / "train_tax_registry_c_1.parquet", 1),
+				read_file(TRAIN_DIR / "train_credit_bureau_b_1.parquet", 1),
+				read_file(TRAIN_DIR / "train_other_1.parquet", 1),
+				read_file(TRAIN_DIR / "train_person_1.parquet", 1),
+				read_file(TRAIN_DIR / "train_deposit_1.parquet", 1),
+				read_file(TRAIN_DIR / "train_debitcard_1.parquet", 1),
+			],
+			"depth_2": [
+				read_file(TRAIN_DIR / "train_credit_bureau_b_2.parquet", 2),
+			]
 		}
-		Classifier = XGBClassifier
-	elif model_name == 'lightgbm':
-		param_grid = {
-			'n_estimators': [2000],
-			'learning_rate': [0.05],
-			'scale_pos_weight': [1, 5, 10, 20, 30, 50],
-			'max_depth': [-1, 5, 10],
-		}
-		Classifier = LGBMClassifier
-	else:
-		break
 
-	grid = ParameterGrid(param_grid)
+		self.df_train = feature_eng(**data_store)
+		print("train data shape:\t", self.df_train.shape)
+		self.df_train = self.df_train.pipe(Pipeline.filter_cols)
+		print("train data shape:\t", self.df_train.shape)
+		self.df_train, cat_cols = to_pandas(self.df_train)
+		self.df_train = reduce_mem_usage(self.df_train)
+		del data_store
+		gc.collect()
+		return self.df_train
 
-	for params in tqdm(grid):
-		model = Classifier(**params)
-		model.fit(base[columns_to_fit], base['target'])
-		tn, fp, fn, tp = confusion_matrix(base['target'], model.predict(base[columns_to_fit])).ravel()
-		feature_importance_dict = {feature: importance for feature, importance in zip(columns_to_fit, model.feature_importances_)}
-		feature_importance_dict = dict(sorted(feature_importance_dict.items(), key=lambda item: item[1], reverse=True))
-		results.append({
-			'model': model_name,
-			'n_estimators': params['n_estimators'],
-			'learning_rate': params['learning_rate'],
-			'scale_pos_weight': params['scale_pos_weight'],
-			'max_depth': params['max_depth'],
-			'importances': feature_importance_dict,
-			'tp': tp,
-			'tn': tn,
-			'fp': fp,
-			'fn': fn})
-		break
-	break
-results_df = pd.DataFrame(results)
 
